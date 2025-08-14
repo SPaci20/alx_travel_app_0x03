@@ -47,6 +47,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -156,3 +157,17 @@ CORS_ALLOW_ALL_ORIGINS = True  # Allow all origins (for development; restrict in
 #     "http://localhost:3000", # React App
 #     "http://127.0.0.1:3000"
 # ]
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / '.env')
+
+CHAPA_SECRET_KEY = os.getenv("CHASECK_TEST-lDvQIEXRsGVoEmWfZTI4WETUOsfFMpSr", "")
+CHAPA_PUBLIC_BASE = os.getenv("https://api.chapa.co", "")
+CHAPA_RETURN_URL = os.getenv("http://localhost:8000/payments/return/", "")
+CHAPA_CALLBACK_URL = os.getenv("http://localhost:8000/api/payments/webhook/", "")
+
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'no-reply@example.com')
+
+# Celery minimal (if you already have Celery, keep your setup)
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')

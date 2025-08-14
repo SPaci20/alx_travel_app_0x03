@@ -98,3 +98,46 @@ class Review(models.Model):
 
     def __str__(self):
         return f"Review {self.review_id} for {self.property_id.title} by {self.user_id.username} - Rating: {self.rating}"
+    
+class Payment(models.Model):
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        SUCCESS = 'SUCCESS', 'Completed'
+        FAILED = 'FAILED', 'Failed'
+        CANCELED = 'CANCELED', 'Canceled'
+
+    booking_reference = models.CharField(max_length=120, db_index=True)
+    # You send tx_ref to Chapa; keep it unique to reconcile verifications.
+    tx_ref = models.CharField(max_length=120, unique=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=8, default='ETB')  # or 'USD' depending on your use-case
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+
+    # Raw data from Chapa for debugging/audits
+    checkout_url = models.URLField(blank=True, null=True)
+    processor_tx_id = models.CharField(max_length=120, blank=True, null=True)  # Chapa’s internal reference if present
+    gateway_payload = models.JSONField(default=dict, blank=True)
+
+    customer_email = models.EmailField(blank=True, null=True)
+    customer_first_name = models.CharField(max_length=60, blank=True, null=True)
+    customer_last_name = models.CharField(max_length=60, blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def mark_success(self, payload: dict):
+        self.status = self.Status.SUCCESS
+        self.gateway_payload = payload or {}
+        # Chapa verify response usually has data.reference
+        ref = (payload or {}).get('data', {}).get('reference')
+        if ref:
+            self.processor_tx_id = ref
+        self.save(update_fields=['status', 'gateway_payload', 'processor_tx_id', 'updated_at'])
+
+    def mark_failed(self, payload: dict):
+        self.status = self.Status.FAILED
+        self.gateway_payload = payload or {}
+        self.save(update_fields=['status', 'gateway_payload', 'updated_at'])
+
+    def __str__(self):
+        return f"""{self.booking_reference} | {self.tx_ref} | {self.status}"""

@@ -1,11 +1,19 @@
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import viewsets, status
-from rest_framework import viewsets
 from rest_framework.response import Response
-from .models import  Booking ,Listing, User
+from rest_framework.views import APIView
+from django.conf import settings
+from django.utils import timezone
+import uuid
+import requests
+
+from .models import Booking, Listing, User, Payment
 from .serializers import BookingSerializer, ListingSerializer, UserSerializer
 
+# -------------------------------
+# User, Booking, Listing ViewSets
+# -------------------------------
 
 class UserViewset(viewsets.ModelViewSet):
     queryset = User.objects.all()
@@ -14,9 +22,10 @@ class UserViewset(viewsets.ModelViewSet):
     lookup_field = 'bookings'
     lookup_field = 'listings'
 
+
 class BookingViewSet(viewsets.ModelViewSet):
     """
-    A viewset for viewing and editing user instances.
+    A viewset for viewing and editing booking instances.
     """
     serializer_class = BookingSerializer
     queryset = Booking.objects.all()
@@ -80,3 +89,149 @@ class ListingViewSet(viewsets.ModelViewSet):
             booking.delete()
             return Response({'message': 'Booking deleted'}, status=status.HTTP_204_NO_CONTENT)
         return Response({'error': 'Booking not found'}, status=status.HTTP_404_NOT_FOUND)
+
+
+# -------------------------------
+# Chapa Payment Integration Views
+# -------------------------------
+
+CHAPA_INIT_URL = f"{settings.CHAPA_PUBLIC_BASE}/v1/transaction/initialize"
+CHAPA_VERIFY_URL = f"{settings.CHAPA_PUBLIC_BASE}/v1/transaction/verify"
+DEFAULT_TIMEOUT = 20  # seconds
+
+class InitiatePaymentAPIView(APIView):
+    """
+    Initialize a payment for a booking using Chapa.
+    """
+    def post(self, request):
+        data = request.data
+        for field in ["booking_reference", "amount", "email"]:
+            if not data.get(field):
+                return Response({"detail": f"{field} is required."}, status=400)
+
+        booking_reference = str(data["booking_reference"])
+        amount = str(data["amount"])
+        currency = data.get("currency", "ETB")
+        email = data["email"]
+        first_name = data.get("first_name", "")
+        last_name = data.get("last_name", "")
+        return_url = data.get("return_url") or settings.CHAPA_RETURN_URL
+        callback_url = settings.CHAPA_CALLBACK_URL
+
+        tx_ref = f"{booking_reference}-{uuid.uuid4().hex[:10]}"
+
+        payload = {
+            "amount": amount,
+            "currency": currency,
+            "email": email,
+            "first_name": first_name,
+            "last_name": last_name,
+            "tx_ref": tx_ref,
+            "return_url": return_url,
+        }
+        if callback_url:
+            payload["callback_url"] = callback_url
+
+        headers = {
+            "Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        payment = Payment.objects.create(
+            booking_reference=booking_reference,
+            tx_ref=tx_ref,
+            amount=amount,
+            currency=currency,
+            status=Payment.Status.PENDING,
+            customer_email=email,
+            customer_first_name=first_name,
+            customer_last_name=last_name,
+        )
+
+        try:
+            resp = requests.post(CHAPA_INIT_URL, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
+            data_resp = resp.json()
+        except Exception as exc:
+            payment.mark_failed({"error": str(exc), "when": "initialize_exception"})
+            return Response({"detail": "Failed to contact payment gateway."}, status=502)
+
+        if resp.status_code == 200 and data_resp.get("status") == "success":
+            checkout_url = data_resp.get("data", {}).get("checkout_url")
+            payment.checkout_url = checkout_url
+            payment.gateway_payload = data_resp
+            payment.save(update_fields=["checkout_url", "gateway_payload", "updated_at"])
+            return Response({
+                "message": "Payment initialized.",
+                "tx_ref": tx_ref,
+                "checkout_url": checkout_url
+            }, status=201)
+
+        payment.mark_failed(data_resp)
+        return Response({"detail": "Payment initialization failed.", "gateway": data_resp}, status=400)
+
+
+class VerifyPaymentAPIView(APIView):
+    """
+    Verify a payment using Chapa.
+    """
+    def get(self, request):
+        tx_ref = request.query_params.get("tx_ref")
+        if not tx_ref:
+            return Response({"detail": "tx_ref is required."}, status=400)
+
+        try:
+            payment = Payment.objects.get(tx_ref=tx_ref)
+        except Payment.DoesNotExist:
+            return Response({"detail": "Payment not found."}, status=404)
+
+        headers = {
+            "Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = requests.get(f"{CHAPA_VERIFY_URL}/{tx_ref}", headers=headers, timeout=DEFAULT_TIMEOUT)
+            data_resp = resp.json()
+        except Exception as exc:
+            return Response({"detail": "Verification error.", "error": str(exc)}, status=502)
+
+        if resp.status_code == 200 and data_resp.get("status") == "success" and data_resp.get("data", {}).get("status") == "success":
+            payment.mark_success(data_resp)
+            # Optional: Celery email task
+            try:
+                from .tasks import send_payment_confirmation_email
+                send_payment_confirmation_email.delay(payment.id)
+            except Exception:
+                pass
+            return Response({
+                "message": "Payment verified successfully.",
+                "status": payment.status,
+                "booking_reference": payment.booking_reference,
+                "amount": str(payment.amount),
+                "currency": payment.currency,
+                "processor_tx_id": payment.processor_tx_id,
+            })
+
+        payment.mark_failed(data_resp)
+        return Response({
+            "message": "Payment not successful.",
+            "status": payment.status,
+            "gateway": data_resp
+        }, status=400)
+
+
+class ChapaWebhookAPIView(APIView):
+    """
+    Optional webhook for Chapa callback.
+    """
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        tx_ref = request.data.get("tx_ref") or request.data.get("data", {}).get("tx_ref")
+        if not tx_ref:
+            return Response({"detail": "tx_ref missing."}, status=400)
+
+        request._request.GET = request._request.GET.copy()
+        request._request.GET["tx_ref"] = tx_ref
+        return VerifyPaymentAPIView().get(request)
