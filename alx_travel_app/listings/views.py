@@ -10,6 +10,8 @@ import requests
 
 from .models import Booking, Listing, User, Payment
 from .serializers import BookingSerializer, ListingSerializer, UserSerializer
+from .tasks import send_booking_confirmation_email
+import logging
 
 # -------------------------------
 # User, Booking, Listing ViewSets
@@ -23,14 +25,51 @@ class UserViewset(viewsets.ModelViewSet):
     lookup_field = 'listings'
 
 
+
 class BookingViewSet(viewsets.ModelViewSet):
-    """
-    A viewset for viewing and editing booking instances.
-    """
-    serializer_class = BookingSerializer
     queryset = Booking.objects.all()
+    serializer_class = BookingSerializer
     permission_classes = [IsAuthenticated]
-    lookup_field = 'bookings'
+    logger = logging.getLogger(__name__)
+
+    def create(self, request, *args, **kwargs):
+        """
+        Create a new booking and trigger email notification
+        """
+        try:
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            booking = serializer.save(user=request.user)
+            send_booking_confirmation_email.delay(
+                booking_id=booking.id,
+                user_email=request.user.email,
+                user_name=request.user.get_full_name() or request.user.username,
+                listing_title=booking.listing.title,
+                check_in_date=booking.check_in_date.strftime('%Y-%m-%d'),
+                check_out_date=booking.check_out_date.strftime('%Y-%m-%d')
+            )
+            self.logger.info(f"Booking created and email task queued for booking {booking.id}")
+            headers = self.get_success_headers(serializer.data)
+            return Response(
+                {
+                    'message': 'Booking created successfully. Confirmation email will be sent shortly.',
+                    'booking': serializer.data
+                },
+                status=status.HTTP_201_CREATED,
+                headers=headers
+            )
+        except Exception as e:
+            self.logger.error(f"Error creating booking: {str(e)}")
+            return Response(
+                {'error': 'Failed to create booking'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def get_queryset(self):
+        """
+        Filter bookings for the current user
+        """
+        return self.queryset.filter(user=self.request.user)
 
 
 class ListingViewSet(viewsets.ModelViewSet):
